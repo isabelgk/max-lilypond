@@ -1,0 +1,149 @@
+<?xml version="1.0" encoding="utf-8" standalone="yes"?>
+<?xml-stylesheet href="./c74ref.xsl" type="text/xsl"?>
+
+<c74object name="lilypond" module="max" category="UI, Notation">
+
+	<digest>
+		Engrave music notation with LilyPond
+	</digest>
+
+	<description>
+		Use the <o>lilypond</o> object to engrave music notation with GNU
+		LilyPond and draw it in the patcher. Supply the notation as LilyPond
+		source text with the <m>set</m> or <m>read</m> message, and the object
+		renders it to vector graphics and resizes the box to fit. LilyPond is
+		not bundled: an existing installation is located automatically, or
+		pointed to with the <at>lilypondpath</at> attribute.
+	</description>
+
+	<discussion>
+		The object does not bundle LilyPond; it drives a separately installed
+		lilypond binary as a subprocess. Install LilyPond yourself (for example
+		with "brew install lilypond" or from lilypond.org), then either let
+		<at>autofind</at> locate it or set <at>lilypondpath</at> explicitly. Use
+		<m>getpath</m> to confirm which binary is active. Notation is rendered on
+		a background thread and redrawn automatically whenever the source or a
+		display attribute changes, so rapid edits stay responsive.
+	</discussion>
+
+	<!--METADATA-->
+	<metadatalist>
+		<metadata name="author">Isabel Kaspriskie</metadata>
+		<metadata name="tag">UI</metadata>
+		<metadata name="tag">notation</metadata>
+	</metadatalist>
+
+	<!--INLETS-->
+	<inletlist>
+		<inlet id="0" type="anything">
+			<digest>set or read LilyPond source</digest>
+		</inlet>
+	</inletlist>
+
+	<!--OUTLETS-->
+	<outletlist>
+	</outletlist>
+
+	<!--ARGUMENTS-->
+	<objarglist>
+	</objarglist>
+
+	<!--MESSAGES-->
+	<methodlist>
+		<method name="set">
+			<arglist>
+				<arg name="source" optional="0" type="list" />
+			</arglist>
+			<digest>
+				Set the LilyPond source text
+			</digest>
+			<description>
+				Joins the message arguments into the LilyPond source and
+				re-renders. Suitable for short snippets without backslash
+				commands, for example <m>set</m> { c' d' e' f' g' }. A Max
+				message box cannot preserve the backslash, brace, or quote
+				characters used by most LilyPond input, so use <m>read</m> for
+				non-trivial scores.
+			</description>
+		</method>
+		<method name="read">
+			<arglist>
+				<arg name="filename" optional="1" type="symbol" />
+			</arglist>
+			<digest>
+				Load LilyPond source from a file
+			</digest>
+			<description>
+				Reads the named .ly file, located on the Max search path, and
+				re-renders. This is the preferred way to supply scores that use
+				backslash commands, which a message box cannot carry.
+			</description>
+		</method>
+		<method name="getpath">
+			<digest>
+				Report the active LilyPond binary path
+			</digest>
+			<description>
+				Posts the path of the lilypond binary that would be used for the
+				next render to the Max console. Useful for confirming which
+				installation is active when <at>lilypondpath</at> is empty and
+				<at>autofind</at> is resolving the binary automatically.
+			</description>
+		</method>
+	</methodlist>
+
+	<!--ATTRIBUTES-->
+	<attributelist>
+		<attribute name="lilypondpath" get="1" set="1" type="symbol" size="1">
+			<digest>
+				Path to the LilyPond binary
+			</digest>
+			<description>
+				Absolute path to the lilypond executable used for rendering.
+				When empty and <at>autofind</at> is enabled, common install
+				locations are probed automatically: Homebrew
+				(/opt/homebrew/bin/lilypond, /usr/local/bin/lilypond), the
+				official relocatable app (/Applications/LilyPond.app), MacPorts,
+				and finally $PATH. Set this to use a specific binary regardless
+				of what auto-find would discover. The discovered path is written
+				back to this attribute after the first successful render, so it
+				is visible in the Inspector.
+			</description>
+		</attribute>
+		<attribute name="autofind" get="1" set="1" type="int" size="1">
+			<digest>
+				Auto-find the LilyPond binary
+			</digest>
+			<description>
+				When enabled (the default), probes common install locations for a
+				lilypond binary whenever <at>lilypondpath</at> is empty. Disable
+				to suppress discovery and require an explicit path.
+			</description>
+		</attribute>
+		<attribute name="size" get="1" set="1" type="float64" size="1">
+			<digest>
+				Pixels per staff-space
+			</digest>
+			<description>
+				Controls how large the notation appears, expressed as the number
+				of screen pixels per staff-space (the gap between two adjacent
+				staff lines). The default is 8.
+			</description>
+		</attribute>
+		<attribute name="margin" get="1" set="1" type="float64" size="1">
+			<digest>
+				Margin around the notation in pixels
+			</digest>
+			<description>
+				Padding in pixels between the rendered notation and the edges of
+				the box. The box is automatically resized to fit the image plus
+				this margin on all sides. The default is 8.
+			</description>
+		</attribute>
+	</attributelist>
+
+	<!--SEEALSO-->
+	<seealsolist>
+	</seealsolist>
+
+</c74object>
