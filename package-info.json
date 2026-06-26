@@ -12,6 +12,12 @@
                 "arm64"
             ],
             "min_version": "none"
+        },
+        "windows": {
+            "platform": [
+                "x64"
+            ],
+            "min_version": "none"
         }
     },
     "package_extra": {
@@ -21,6 +27,6 @@
     "tags": [
         "ui"
     ],
-    "version": "0.1.0",
+    "version": "0.1.0-alpha2",
     "website": "http://www.github.com/isabelgk/max-lilypond"
 }

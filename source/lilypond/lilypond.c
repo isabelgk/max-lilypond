@@ -8,13 +8,17 @@
 // We do not bundle LilyPond (GPL-3 redistribution, notarizing third-party
 // binaries, version-pin maintenance). Instead the binary is discovered at
 // render time: an explicit @lilypondpath override wins, otherwise we probe the
-// common install locations (Homebrew, the official app, MacPorts) and finally
-// $PATH. When nothing is found we post an actionable install hint.
+// common install locations and finally PATH. When nothing is found we post an
+// actionable install hint.
 //
 // The subprocess + file I/O run on a background thread (systhread); SVG
 // creation, box resizing, and redraw happen only on the main thread, marshaled
 // back via a qelem. A per-request generation counter drops stale results so
 // rapid edits never paint an out-of-date image.
+//
+// macOS and Windows are both supported. The OS-specific process and filesystem
+// calls (spawn/wait/kill, executable probing, temp dir) are isolated behind a
+// small platform seam (see the lp_* helpers) so the rest of the code is shared.
 //
 // The .ly source is held as an object-owned string. It is set via the `set`
 // message or loaded from disk with `read`, and persisted in the patcher via
@@ -25,22 +29,202 @@
 #include "jpatcher_api.h"
 #include "jgraphics.h"
 
-#ifdef MAC_VERSION
+#if defined(MAC_VERSION) || defined(WIN_VERSION)
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#ifdef WIN_VERSION
+#include <windows.h>
+#include <io.h>
+// POSIX names the CRT exposes only under an underscore prefix.
+#define strdup _strdup
+#define unlink _unlink
+#else // MAC_VERSION
 #include <unistd.h>
 #include <spawn.h>
 #include <signal.h>
 #include <fcntl.h>
 #include <sys/wait.h>
 #include <sys/stat.h>
-
 extern char** environ;
+#endif
 
 // Default LilyPond source rendered before the user supplies any.
 #define LILYPOND_DEFAULT_SOURCE "{ c' d' e' f' g' }"
+
+// --- Platform seam -------------------------------------------------------
+// Everything below isolates the OS-specific process and filesystem calls so
+// the render worker stays platform-neutral. macOS uses posix_spawn/waitpid;
+// Windows uses CreateProcess/WaitForSingleObject.
+
+#ifdef WIN_VERSION
+#define LP_PATH_SEP ';'
+#define LP_DIR_SEP "\\"
+#define LP_EXE_NAME "lilypond.exe"
+#else
+#define LP_PATH_SEP ':'
+#define LP_DIR_SEP "/"
+#define LP_EXE_NAME "lilypond"
+#endif
+
+// A running child process. `active` disambiguates a live handle/pid from a
+// zeroed one and is the mutex-guarded signal that free() may still kill it.
+typedef struct _lp_child {
+#ifdef WIN_VERSION
+    HANDLE handle;
+#else
+    pid_t pid;
+#endif
+    char active;
+} lp_child;
+
+// Is `path` an executable file we could launch?
+static int lp_is_executable(const char* path)
+{
+#ifdef WIN_VERSION
+    DWORD attr = GetFileAttributesA(path);
+    return attr != INVALID_FILE_ATTRIBUTES && !(attr & FILE_ATTRIBUTE_DIRECTORY);
+#else
+    return access(path, X_OK) == 0;
+#endif
+}
+
+// The per-process temp directory.
+static const char* lp_tmpdir(void)
+{
+#ifdef WIN_VERSION
+    const char* t = getenv("TEMP");
+    if (!t || !t[0]) {
+        t = getenv("TMP");
+    }
+    if (!t || !t[0]) {
+        t = ".";
+    }
+    return t;
+#else
+    const char* t = getenv("TMPDIR");
+    if (!t || !t[0]) {
+        t = "/tmp";
+    }
+    return t;
+#endif
+}
+
+// Launch lilypond, redirecting its stdout+stderr to `logpath`. Fills `*child`
+// and returns 0 on success, nonzero if the binary could not be launched.
+static int lp_spawn(const char* binpath, const char* base, const char* input,
+                    const char* logpath, lp_child* child)
+{
+#ifdef WIN_VERSION
+    // CreateProcess takes one mutable command line, not an argv array. Both the
+    // binary and the temp paths can contain spaces, so quote each token.
+    char cmdline[4096];
+    snprintf(cmdline, sizeof(cmdline),
+             "\"%s\" -dbackend=svg -dcrop -dno-point-and-click -o \"%s\" \"%s\"",
+             binpath, base, input);
+
+    // The child must inherit the log handle for the redirect to take effect.
+    SECURITY_ATTRIBUTES sa;
+    sa.nLength = sizeof(sa);
+    sa.lpSecurityDescriptor = NULL;
+    sa.bInheritHandle = TRUE;
+    HANDLE hlog = CreateFileA(logpath, GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                              &sa, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hlog == INVALID_HANDLE_VALUE) {
+        hlog = NULL; // run without the redirect rather than fail outright
+    }
+
+    STARTUPINFOA si;
+    PROCESS_INFORMATION pi;
+    memset(&si, 0, sizeof(si));
+    memset(&pi, 0, sizeof(pi));
+    si.cb = sizeof(si);
+    if (hlog) {
+        si.dwFlags = STARTF_USESTDHANDLES;
+        si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+        si.hStdOutput = hlog;
+        si.hStdError = hlog;
+    }
+
+    BOOL ok = CreateProcessA(binpath, cmdline, NULL, NULL, hlog ? TRUE : FALSE,
+                             CREATE_NO_WINDOW, NULL, NULL, &si, &pi);
+    if (hlog) {
+        CloseHandle(hlog);
+    }
+    if (!ok) {
+        return 1;
+    }
+
+    CloseHandle(pi.hThread); // we never use the primary-thread handle
+    child->handle = pi.hProcess;
+    child->active = 1;
+    return 0;
+#else
+    char* spawn_argv[] = {
+        (char*)binpath, "-dbackend=svg", "-dcrop", "-dno-point-and-click",
+        "-o", (char*)base, (char*)input, NULL
+    };
+
+    posix_spawn_file_actions_t fa;
+    posix_spawn_file_actions_init(&fa);
+    // Capture stdout+stderr into the log file so it never blocks on a pipe.
+    posix_spawn_file_actions_addopen(&fa, STDOUT_FILENO, logpath, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    posix_spawn_file_actions_adddup2(&fa, STDOUT_FILENO, STDERR_FILENO);
+
+    pid_t pid = 0;
+    int rc = posix_spawn(&pid, binpath, &fa, NULL, spawn_argv, environ);
+    posix_spawn_file_actions_destroy(&fa);
+
+    if (rc != 0) {
+        return rc;
+    }
+    child->pid = pid;
+    child->active = 1;
+    return 0;
+#endif
+}
+
+// Block until the child exits. Leaves the handle open (on Windows) so a racing
+// free() can still signal it; lp_close reclaims it afterward.
+static void lp_wait(lp_child* child)
+{
+#ifdef WIN_VERSION
+    if (child->handle) {
+        WaitForSingleObject(child->handle, INFINITE);
+    }
+#else
+    int status = 0;
+    waitpid(child->pid, &status, 0);
+#endif
+}
+
+// Force-terminate the child. Signal only — never closes/reaps, mirroring the
+// macOS kill(): the worker owns reaping so there is exactly one close path.
+static void lp_kill(lp_child* child)
+{
+#ifdef WIN_VERSION
+    if (child->handle) {
+        TerminateProcess(child->handle, 1);
+    }
+#else
+    kill(child->pid, SIGKILL);
+#endif
+}
+
+// Release the OS handle for an already-waited child (no-op on macOS).
+static void lp_close(lp_child* child)
+{
+#ifdef WIN_VERSION
+    if (child->handle) {
+        CloseHandle(child->handle);
+        child->handle = NULL;
+    }
+#else
+    (void)child;
+#endif
+}
 
 typedef struct _lilypond
 {
@@ -74,7 +258,7 @@ typedef struct _lilypond
     long result_svg_len;
     char* result_err; // captured stderr on failure (malloc'd)
     char result_binpath[MAX_PATH_CHARS]; // auto-discovered path, empty if override was used
-    int child_pid; // running subprocess, for kill-on-free
+    lp_child child; // running subprocess, for kill-on-free (guarded by mutex)
 } t_lilypond;
 
 void* lilypond_new(t_symbol* s, long argc, t_atom* argv);
@@ -103,13 +287,32 @@ static t_class* s_lilypond_class = NULL;
 static t_symbol* ps_lilypond = NULL;
 
 // Message posted when no LilyPond binary can be found.
+#ifdef WIN_VERSION
+#define LILYPOND_NOTFOUND_MSG                                              \
+    "lilypond: no LilyPond binary found. Install it from "                 \
+    "https://lilypond.org/download.html, then set the @lilypondpath "      \
+    "attribute to lilypond.exe."
+#else
 #define LILYPOND_NOTFOUND_MSG                                               \
     "lilypond: no LilyPond binary found. Install it (e.g. \"brew install "  \
     "lilypond\" or from https://lilypond.org/download.html), then set the " \
     "@lilypondpath attribute."
+#endif
 
 // Common absolute install locations, probed in order before falling back to
-// $PATH. Homebrew (arm64, then Intel), the official relocatable app, MacPorts.
+// PATH.
+#ifdef WIN_VERSION
+// Windows LilyPond now ships as a portable zip with no installer, registry
+// key, or fixed path, so there is no reliable location to probe — @lilypondpath
+// and the PATH scan below are the dependable mechanisms. These two are
+// best-effort guesses at where a user might have unpacked it.
+static const char* const k_lilypond_candidates[] = {
+    "C:\\Program Files\\LilyPond\\bin\\lilypond.exe",
+    "C:\\Program Files (x86)\\LilyPond\\usr\\bin\\lilypond.exe",
+    NULL
+};
+#else
+// Homebrew (arm64, then Intel), the official relocatable app, MacPorts.
 static const char* const k_lilypond_candidates[] = {
     "/opt/homebrew/bin/lilypond",
     "/usr/local/bin/lilypond",
@@ -117,40 +320,41 @@ static const char* const k_lilypond_candidates[] = {
     "/opt/local/bin/lilypond",
     NULL
 };
+#endif
 
 // Discover an installed lilypond binary. Returns 1 and fills `out`
-// (MAX_PATH_CHARS) on success, 0 if none found. Pure POSIX and thread-safe (no
-// Max API), so it is safe to call from the render worker.
+// (MAX_PATH_CHARS) on success, 0 if none found. Touches only the filesystem
+// (no Max API), so it is safe to call from the render worker.
 static int lilypond_discover_default(char* out)
 {
     for (int i = 0; k_lilypond_candidates[i]; i++) {
-        if (access(k_lilypond_candidates[i], X_OK) == 0) {
+        if (lp_is_executable(k_lilypond_candidates[i])) {
             strncpy(out, k_lilypond_candidates[i], MAX_PATH_CHARS - 1);
             out[MAX_PATH_CHARS - 1] = '\0';
             return 1;
         }
     }
 
-    // Scan $PATH last. Rarely useful: Max is a GUI app and usually doesn't
+    // Scan PATH last. Rarely useful: Max is a GUI app and usually doesn't
     // inherit the shell PATH, which is why the explicit locations come first.
     const char* path = getenv("PATH");
     for (const char* p = path; p && *p;) {
-        const char* colon = strchr(p, ':');
-        size_t dirlen = colon ? (size_t)(colon - p) : strlen(p);
-        if (dirlen > 0 && dirlen + strlen("/lilypond") < MAX_PATH_CHARS) {
+        const char* sep = strchr(p, LP_PATH_SEP);
+        size_t dirlen = sep ? (size_t)(sep - p) : strlen(p);
+        if (dirlen > 0 && dirlen + strlen(LP_DIR_SEP LP_EXE_NAME) < MAX_PATH_CHARS) {
             char cand[MAX_PATH_CHARS];
             memcpy(cand, p, dirlen);
-            snprintf(cand + dirlen, sizeof(cand) - dirlen, "/lilypond");
-            if (access(cand, X_OK) == 0) {
+            snprintf(cand + dirlen, sizeof(cand) - dirlen, LP_DIR_SEP LP_EXE_NAME);
+            if (lp_is_executable(cand)) {
                 strncpy(out, cand, MAX_PATH_CHARS - 1);
                 out[MAX_PATH_CHARS - 1] = '\0';
                 return 1;
             }
         }
-        if (!colon) {
+        if (!sep) {
             break;
         }
-        p = colon + 1;
+        p = sep + 1;
     }
 
     out[0] = '\0';
@@ -247,7 +451,7 @@ void* lilypond_new(t_symbol* s, long argc, t_atom* argv)
     x->result_svg_len = 0;
     x->result_err = NULL;
     x->result_binpath[0] = '\0';
-    x->child_pid = 0;
+    memset(&x->child, 0, sizeof(x->child));
 
     systhread_mutex_new(&x->mutex, 0);
     x->done_qelem = qelem_new((t_object*)x, (method)lilypond_render_done);
@@ -279,13 +483,14 @@ void* lilypond_new(t_symbol* s, long argc, t_atom* argv)
 
 void lilypond_free(t_lilypond* x)
 {
-    // Stop any in-flight render: signal quit, kill the child so waitpid returns
-    // promptly, then join the worker before tearing anything down.
+    // Stop any in-flight render: signal quit, kill the child so the wait returns
+    // promptly, then join the worker before tearing anything down. We only
+    // signal here; the worker still owns reaping and closing the child handle.
     if (x->mutex) {
         systhread_mutex_lock(x->mutex);
         x->quit = 1;
-        if (x->child_pid > 0) {
-            kill(x->child_pid, SIGKILL);
+        if (x->child.active) {
+            lp_kill(&x->child);
         }
         systhread_mutex_unlock(x->mutex);
     }
@@ -631,10 +836,7 @@ void lilypond_render_worker(t_lilypond* x)
     }
 
     // build the temp file paths (instance + generation unique)
-    const char* tmp = getenv("TMPDIR");
-    if (!tmp || !tmp[0]) {
-        tmp = "/tmp";
-    }
+    const char* tmp = lp_tmpdir();
 
     char base[MAX_PATH_CHARS], input[MAX_PATH_CHARS];
     char svgcropped[MAX_PATH_CHARS], svgfull[MAX_PATH_CHARS], errpath[MAX_PATH_CHARS];
@@ -670,21 +872,9 @@ void lilypond_render_worker(t_lilypond* x)
         fputc('\n', lyf);
         fclose(lyf);
 
-        // spawn the lilypond subprocess
-        char* spawn_argv[] = {
-            binpath, "-dbackend=svg", "-dcrop", "-dno-point-and-click",
-            "-o", base, input, NULL
-        };
-
-        posix_spawn_file_actions_t fa;
-        posix_spawn_file_actions_init(&fa);
-        // Capture stdout+stderr into the log file so it never blocks on a pipe.
-        posix_spawn_file_actions_addopen(&fa, STDOUT_FILENO, errpath, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-        posix_spawn_file_actions_adddup2(&fa, STDOUT_FILENO, STDERR_FILENO);
-
-        pid_t pid = 0;
-        int spawn_rc = posix_spawn(&pid, binpath, &fa, NULL, spawn_argv, environ);
-        posix_spawn_file_actions_destroy(&fa);
+        // spawn the lilypond subprocess (stdout+stderr -> errpath)
+        lp_child child = { 0 };
+        int spawn_rc = lp_spawn(binpath, base, input, errpath, &child);
 
         if (spawn_rc != 0) {
             char msg[MAX_PATH_CHARS + 64];
@@ -693,23 +883,26 @@ void lilypond_render_worker(t_lilypond* x)
         }
         else {
             // Register the child so free() can kill it; bail if quit raced in.
+            // Ownership of the handle stays with this worker either way.
             char killed = 0;
             systhread_mutex_lock(x->mutex);
             if (x->quit) {
-                kill(pid, SIGKILL);
+                lp_kill(&child);
                 killed = 1;
             }
             else {
-                x->child_pid = pid;
+                x->child = child;
             }
             systhread_mutex_unlock(x->mutex);
 
-            int status = 0;
-            waitpid(pid, &status, 0);
+            lp_wait(&child);
 
+            // Mark inactive before closing the handle so a racing free() (which
+            // only acts while active) can no longer touch it.
             systhread_mutex_lock(x->mutex);
-            x->child_pid = 0;
+            x->child.active = 0;
             systhread_mutex_unlock(x->mutex);
+            lp_close(&child);
 
             if (!killed) {
                 svg_bytes = lilypond_slurp(svgcropped, &svg_len);
@@ -846,12 +1039,12 @@ void lilypond_render_done(t_lilypond* x)
     }
 }
 
-#else // !MAC_VERSION
+#else // unsupported platform
 
 void ext_main(void* r)
 {
     (void)r;
-    object_error(NULL, "lilypond: this object is only supported on macOS");
+    object_error(NULL, "lilypond: this object is only supported on macOS and Windows");
 }
 
-#endif // MAC_VERSION
+#endif // MAC_VERSION || WIN_VERSION
