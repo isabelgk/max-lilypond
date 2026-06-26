@@ -36,3 +36,8 @@ This assembles a complete Max package under `build/package` (with the external
 in `build/package/externals/`) rather than writing into the source tree.
 Override with `-DMAX_SDK_PACKAGE_OUT_OF_TREE=OFF` to build into the source tree
 instead.
+
+## License
+
+[MIT](LICENSE). Note that LilyPond itself is GPL-3 and is not distributed with
+this package.
