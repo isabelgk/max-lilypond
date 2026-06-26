@@ -1,5 +1,7 @@
 # max-lilypond
 
+![preview](img/preview.png)
+
 ## Building
 
 ```
